@@ -1,3 +1,9 @@
+from astropy.wcs import WCS
+from casatools import image as IA
+from datetime import datetime
+from casatools import simulator, measures, vpmanager, image
+from astropy.io import fits
+from itertools import combinations
 import matplotlib
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,6 +12,69 @@ from scipy.constants import c
 import os
 from casatools import vpmanager, quanta
 from scipy.stats import binned_statistic
+import sunpy.map
+from scipy.spatial.distance import pdist
+import time
+from functools import wraps
+
+def make_msname(project: str,
+                target: str,
+                freq: str,
+                reftime: datetime,
+                duration: int,
+                integration: int,
+                config: str,
+                noise: str = None,
+                ) -> str:
+    msfilepath = os.path.join(project, 'msfiles', target)
+    if not os.path.exists(msfilepath):
+        os.makedirs(msfilepath)
+    return os.path.join(msfilepath,
+                        f'fasr_{target}_{freq}_{reftime.strftime("%Y%m%dT%H%M%SUT")}_dur{duration}s_int{integration:0d}s_{os.path.basename(config.rstrip(".cfg"))}_noise{noise}')
+
+
+def make_imname(msname: str,
+                deconvolver: str = 'hogbom',
+                phaerr: float = None,
+                amperr: float = None
+                ) -> str:
+    parts = [msname]
+    if phaerr is not None:
+        parts.append(f'phaerr{np.int_(phaerr * 100)}pct')
+    if amperr is not None:
+        parts.append(f'amperr{np.int_(amperr * 100)}pct')
+    parts.append(deconvolver)
+    return '_'.join(parts)
+
+def format_duration(seconds):
+    """Format seconds into appropriate unit string."""
+    if seconds < 60:
+        return f"{seconds:.2f} seconds"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.2f} minutes"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{hours:.2f} hours"
+    days = hours / 24
+    return f"{days:.2f} days"
+
+
+def runtime_report(func):
+    """Decorator to report runtime of a function and log completion time."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        end = time.time()
+        duration = end - start
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(
+            f"'{func.__name__}' completed at {now}; "
+            f"runtime: {format_duration(duration)}"
+        )
+        return result
+    return wrapper
 
 qa = quanta()
 vp = vpmanager()
@@ -14,6 +83,85 @@ vp = vpmanager()
 C_LIGHT = c
 
 
+def jy2mk(I, nu, res_arcsec):
+    '''
+    Convert intensity in Jy to brightness temperature in MK.
+
+    Parameters:
+        I: intensity in Jy/beam
+        nu: frequency in GHz
+        res_arcsec: angular resolution in arcseconds
+
+    Returns:
+        Tb: brightness temperature in MK
+    '''
+    Tb = 1.22e6 * I / (nu * res_arcsec) ** 2 * 1e-6
+    return Tb
+
+
+def mk2jy(Tb, nu, res_arcsec):
+    '''
+    Convert brightness temperature in MK to intensity in Jy/beam.
+
+    Parameters:
+        Tb: brightness temperature in MK
+        nu: frequency in GHz
+        res_arcsec: angular resolution in arcseconds
+
+    Returns:
+        I: intensity in Jy/beam
+    '''
+    I = Tb * (nu * res_arcsec) ** 2 * 1e6 / 1.22e6
+    return I
+
+def get_baseline_lengths(filename):
+    '''
+    Computes the baseline length given a configuration file. Assumes source is at zenith
+    '''
+    data = np.loadtxt(filename, usecols=(0, 1))
+    return pdist(data)
+
+
+def get_max_resolution(freq, max_baseline):
+    '''
+    freq in GHz, max_baseline in m
+    '''
+    wavelength = 299792458/(freq*1e9)
+    res = wavelength/max_baseline*180/3.14159*3600
+    return res  # in arcsec
+
+def calc_noise(noise_tb, array_config_file, freq_ghz, duration, integration_time):
+    """
+    Calculate the noise level for a given array configuration and frequency.
+
+    Parameters:
+      noise_tb : str
+          Noise temperature in MK (e.g., '0.5MK').
+      array_config_file : str
+          Path to the antenna configuration file.
+      freq_ghz : float
+          Frequency in GHz.
+      duration : int
+          Total observation duration in seconds.
+      integration_time : int
+          Integration time in seconds.
+
+    Reference: https://casaguides.nrao.edu/index.php/Simulating_ngVLA_Data-CASA5.4.1#Estimating_the_Scaling_Parameter_for_Adding_Thermal_Noise
+
+    Returns:
+      float: Calculated noise level in Jy.
+    """
+    # Get baseline lengths from the antenna configuration file.
+    baseline_lengths = get_baseline_lengths(array_config_file)
+    N_bl = len(baseline_lengths)
+    bmsize = get_max_resolution(freq_ghz, np.nanmax(baseline_lengths))
+    sigma_na = mk2jy(float(noise_tb.rstrip('MK')), freq_ghz, bmsize)
+    N_integrations = duration / integration_time
+    noisejy = sigma_na * np.sqrt(1 * 2 * len(baseline_lengths) * N_integrations)
+    print(f"noise: {noisejy:.2f} Jy for {N_bl} baselines at {freq_ghz} GHz")
+    return noisejy
+
+@runtime_report
 def airy_model(R, s, A):
     """
     Compute the Airy pattern for a uniform disk of radius R (arcsec) at uv distance s (in wavelengths).
@@ -44,11 +192,6 @@ def disk_size_function(v, c1, alpha1, c2, alpha2):
     Returns disk radius in arcseconds.
     """
     return c1 * v ** (-alpha1) + c2 * v ** (-alpha2)
-
-
-import numpy as np
-import matplotlib.pyplot as plt
-from itertools import combinations
 
 
 def generate_fibonacci_spiral_antenna_positions(n_antennas=20, scale=5, latitude=39.54780):
@@ -116,7 +259,7 @@ def generate_golden_spiral_antenna_positions(n_antennas=20, r0=5, r_max=100, n_t
     positions[:, 1] *= aspect
     return positions
 
-
+@runtime_report
 def generate_log_spiral_antenna_positions(n_arms=3, antennas_per_arm=6, n_turn=1.0, r0=5, r_max=100,
                                           alpha=1.0, gamma=1.0, latitude=39.54780):
     """
@@ -162,9 +305,11 @@ def generate_log_spiral_antenna_positions(n_arms=3, antennas_per_arm=6, n_turn=1
     # Create an array of indices along a single arm.
     i_vals = np.arange(antennas_per_arm)
     # Compute the array of angles for one arm.
-    theta_arm = (theta_max * i_vals) / (antennas_per_arm - 1)  # shape: (antennas_per_arm,)
+    # shape: (antennas_per_arm,)
+    theta_arm = (theta_max * i_vals) / (antennas_per_arm - 1)
     # Calculate radial distances for these angles.
-    r_vals = r0 * np.exp(beta * (theta_arm ** gamma))  # shape: (antennas_per_arm,)
+    # shape: (antennas_per_arm,)
+    r_vals = r0 * np.exp(beta * (theta_arm ** gamma))
     # print(r_vals)
 
     # Create an array for the arm indices.
@@ -173,11 +318,11 @@ def generate_log_spiral_antenna_positions(n_arms=3, antennas_per_arm=6, n_turn=1
     theta_offset = (2 * np.pi * arm_indices) / n_arms  # shape: (n_arms,)
 
     # Broadcast to compute total angle for each antenna on every arm.
-    theta_total = -alpha * theta_arm[None, :] + theta_offset[:, None]  # shape: (n_arms, antennas_per_arm)
+    # shape: (n_arms, antennas_per_arm)
+    theta_total = -alpha * theta_arm[None, :] + theta_offset[:, None]
     # Broadcast radial values.
     r_matrix = r_vals[None, :]  # shape: (1, antennas_per_arm)
     theta_total[:, 0] += np.pi / 4
-
 
     # Compute x and y positions.
     x_mat = r_matrix * np.cos(theta_total)  # shape: (n_arms, antennas_per_arm)
@@ -266,7 +411,8 @@ def generate_pseudorandom_disk_antenna_positions(n_antennas=20, radius=150, n_ed
           Array of shape (n_antennas, 2) containing (x, y) positions in meters.
     """
     if n_antennas < cluster_antennas:
-        raise ValueError("n_antennas must be at least equal to cluster_antennas.")
+        raise ValueError(
+            "n_antennas must be at least equal to cluster_antennas.")
 
     # --- Generate Dense Cluster ---
     r_cluster = cluster_radius * np.sqrt(np.random.rand(cluster_antennas))
@@ -354,318 +500,6 @@ def compute_uv_coverage(positions):
     return np.array(uv_points)
 
 
-def plot_all_panels0(positions, title):
-    '''
-    Plot all panels for the given antenna positions in a 2x2 layout.
-    '''
-    uv = compute_uv_coverage(positions)
-
-    # Create a 2x2 layout
-    fig, axs = plt.subplots(2, 2, figsize=(12, 10))
-
-    # Panel 1: Antenna Layout
-    ax1 = axs[0, 0]
-    ax1.set_title(f"{title} - Antenna Layout")
-    ax1.plot(positions[:, 0], positions[:, 1], 'o')
-    ax1.set_xlabel("X (m)")
-    ax1.set_ylabel("Y (m)")
-    ax1.axis('equal')
-    # ax1.grid(True)
-
-    # Panel 2: UV Coverage
-    ax2 = axs[0, 1]
-    ax2.set_title(f"{title} - UV Coverage")
-    ax2.plot(uv[:, 0], uv[:, 1], '.', markersize=1)
-    ax2.set_xlabel("u (m)")
-    ax2.set_ylabel("v (m)")
-    ax2.axis('equal')
-    #     ax2.grid(True)
-
-    # Panel 3: UV Density vs. UV Distance
-    ax3 = axs[1, 0]
-    # Compute radial distances of the uv points
-    uv_dist = np.sqrt(uv[:, 0] ** 2 + uv[:, 1] ** 2)
-    bins = np.arange(0, np.max(uv_dist) + 10, 10)
-    counts, bin_edges = np.histogram(uv_dist, bins=bins)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    ax3.step(bin_centers, counts, where='mid')
-    ax3.set_title("UV Sampling Density")
-    ax3.set_xlabel("UV Distance [m]")
-    ax3.set_ylabel("Density (counts)")
-    ax3.axhline(10, ls='--', color='gray', label='Nyquist sampling rate (20 GHz)')
-    ax3.axhline(5.26, ls=':', color='gray', label='Nyquist sampling rate (10 GHz)')
-    ax3.set_ylim(0, 100)
-    # ax3.grid(True)
-    ax3.legend()
-
-    # Panel 4: PSF of the UV Sampling
-    ax4 = axs[1, 1]
-    # Define grid parameters for 2D histogram
-    grid_size = 256
-    u_min, u_max = -120, 120
-    v_min, v_max = -120, 120
-    H, xedges, yedges = np.histogram2d(uv[:, 0], uv[:, 1], bins=grid_size, range=[[u_min, u_max], [v_min, v_max]])
-    # Compute the PSF via FFT of the sampling grid
-    psf = np.abs(np.fft.fftshift(np.fft.fft2(H)))
-    extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
-    im = ax4.imshow(psf, extent=extent, origin='lower', aspect='equal', cmap='viridis')
-    ax4.set_title("PSF of UV Sampling")
-    ax4.set_xlabel("Image Plane X (arbitrary)")
-    ax4.set_ylabel("Image Plane Y (arbitrary)")
-    fig.colorbar(im, ax=ax4, fraction=0.046, pad=0.04)
-
-    fig.tight_layout()
-
-
-
-def plot_all_panels1(positions, title='', labels=[], frequency=2, nyq_sample=None,
-                    figname=None, array_config_str=None, psf_mode='profile'):
-    """
-    Plot antenna positions, UV coverage, and (optionally) PSF or UV sampling density.
-
-    If the input is a single 2D NumPy array (shape (N,2)), it is interpreted as one
-    antenna configuration, and a 2x3 layout (including a PSF panel) is used.
-
-    If the input is a list/tuple of 2D NumPy arrays, each array is treated as a separate
-    configuration and a 2x2 layout (without the PSF panel) is produced.
-
-    In single-set mode, if psf_mode == 'image', the PSF panel shows the 2D PSF image.
-    If psf_mode == 'profile', the PSF panel shows the averaged radial profile
-    (mean intensity versus radius in arcsec).
-
-    Parameters:
-      positions : numpy.ndarray or list/tuple of numpy.ndarray
-          Either a single array of shape (N,2) or a list of such arrays.
-      title : str, optional
-          Title text for the plots.
-      labels : list, optional
-          List of labels for multiple configurations.
-      frequency : float, optional
-          Frequency in GHz (used for PSF calculation in single-set mode).
-      nyq_sample : dict or None, optional
-          Dictionary of Nyquist sampling rates to draw horizontal reference lines in the density plot.
-      figname : str or None, optional
-          If provided, saves the figure with this filename.
-      array_config_str : str or None, optional
-          If provided, displays this text at the upper center of the figure.
-      psf_mode : str, optional
-          Either 'image' or 'profile'; in single-set mode, determines how to display the PSF.
-
-    Returns:
-      fig, axes : tuple
-          The Matplotlib figure and a tuple of axis objects.
-    """
-    import matplotlib.gridspec as gridspec
-    # Ensure the input is a list of 2D arrays.
-    if isinstance(positions, np.ndarray):
-        # Check that it is 2D.
-        if positions.ndim == 2:
-            pos_list = [positions]
-        else:
-            raise ValueError("If 'positions' is a numpy array, it must be 2D with shape (N,2).")
-    elif isinstance(positions, (list, tuple)):
-        # Check that each element is a 2D numpy array.
-        pos_list = []
-        for pos in positions:
-            if not (isinstance(pos, np.ndarray) and pos.ndim == 2):
-                raise ValueError("Every element in 'positions' must be a 2D numpy array with shape (N,2).")
-            pos_list.append(pos)
-    else:
-        raise ValueError("'positions' must be either a 2D numpy array or a list/tuple of 2D numpy arrays.")
-
-
-    # If only one set is provided, use a 2x3 layout (with PSF panel).
-    if len(pos_list) == 1:
-        pos = pos_list[0]
-        fig = plt.figure(figsize=(12, 8))
-        gs = gridspec.GridSpec(2, 3, height_ratios=[3, 1])
-
-        uv = compute_uv_coverage(pos)
-        # Panel 1 (top left): Antenna Layout
-        ax_ant = fig.add_subplot(gs[0, 0])
-        ax_ant.set_title(f"{title} - {len(pos[:, 0])} Antenna Layout")
-        ax_ant.plot(pos[:, 0], pos[:, 1], 'o')
-        ax_ant.set_xlabel("X [m]")
-        ax_ant.set_ylabel("Y [m]")
-        ax_ant.set_aspect('equal')
-        # ax_ant.grid(True)
-
-        # Add equation text based on the title keyword
-        eq_text = ""
-        if "Fibonacci" in title:
-            eq_text = r"$r = \varphi^{\frac{2\theta}{\pi}},\quad \varphi = \frac{1+\sqrt{5}}{2}$"
-        elif "Golden" in title:
-            eq_text = r"$r = r_0\,e^{\beta \theta},\quad \beta = \frac{\ln\left(\frac{r_{max}}{r_0}\right)}{\theta_{max}},\quad \theta_{max}=n_{turns}\cdot2\pi$"
-        elif "Log" in title:
-            eq_text = r"$r = r_0\,\exp\left(\beta\,\theta^\gamma\right),\quad \beta = \frac{\ln\left({r_{max}}/{r_0}\right)}{\theta_{max}^\gamma}$"
-        elif "Archimedean" in title:
-            eq_text = r"$r = a + b\,\theta$"
-        else:
-            eq_text = r"Equation not specified."
-        ax_ant.text(0.02, 0.98, eq_text, transform=ax_ant.transAxes, fontsize=12,
-                    verticalalignment='top', bbox=dict(facecolor='white', alpha=0.5, edgecolor='gray'))
-
-        # Panel 2 (top center): UV Coverage
-        ax_uvcov = fig.add_subplot(gs[0, 1])
-        ax_uvcov.set_title(f"{title} - UV Coverage")
-        ax_uvcov.plot(uv[:, 0], uv[:, 1], '.', markersize=1)
-        ax_uvcov.set_xlabel("u [m]")
-        ax_uvcov.set_ylabel("v [m]")
-        ax_uvcov.set_aspect('equal')
-        #     ax_uvcov.grid(True)
-
-        # Panel 3 (top right): PSF of UV Sampling
-        ax_psf = fig.add_subplot(gs[0, 2])
-        ax_psf.set_title(f"PSF ({frequency:.1f} GHz)")
-        # Define grid parameters for 2D histogram
-        grid_size = 128
-        padded_size = grid_size * 8
-        u_min, u_max = np.min(uv[:, 0]), np.max(uv[:, 0])
-        v_min, v_max = np.min(uv[:, 1]), np.max(uv[:, 1])
-        H, xedges, yedges = np.histogram2d(uv[:, 0], uv[:, 1],
-                                           bins=grid_size,
-                                           range=[[u_min, u_max], [v_min, v_max]])
-        psf = np.abs(np.fft.fftshift(np.fft.fft2(H, s=(padded_size, padded_size))))
-        # Convert the uv grid (meters) to image plane coordinates in arcsec
-        # First, compute the wavelength (m) from the input frequency (GHz)
-        lambda_m = C_LIGHT / (frequency * 1e9)
-        # The uv grid spans (u_max - u_min) in meters, which corresponds to (u_max - u_min)/λ in wavelengths.
-        # In Fourier transform, the pixel scale in radians is ~ 1/(grid_size*Δu) with Δu in wavelengths.
-        # Here, Δu = (u_max - u_min)/grid_size in meters, so in wavelengths it is Δu/λ.
-        # Thus, the image pixel scale is:
-        pixel_scale_rad = (grid_size * lambda_m) / ((u_max - u_min) * padded_size)
-        pixel_scale_arcsec = pixel_scale_rad * 206265
-        # Total field-of-view (FOV) in arcsec:
-        fov_arcsec = padded_size * pixel_scale_arcsec
-        extent = [-fov_arcsec/2, fov_arcsec/2, -fov_arcsec/2, fov_arcsec/2]
-
-        if psf_mode == 'image':
-            im_psf = ax_psf.imshow(psf, extent=extent, origin='lower', aspect='equal', cmap='viridis')
-            ax_psf.set_xlabel("RA [arcsec]")
-            ax_psf.set_ylabel("DEC [arcsec]")
-            # plt.colorbar(im_psf, ax=ax_psf)
-        elif psf_mode == 'profile':
-            # Compute the averaged radial profile of the PSF.
-            # Create a grid of indices and calculate the radius from the center.
-            y_idx, x_idx = np.indices(psf.shape)
-            center = (psf.shape[0] // 2, psf.shape[1] // 2)
-            r = np.sqrt((x_idx - center[1])**2 + (y_idx - center[0])**2)
-            # Use binned_statistic to average the intensity in radial bins.
-            bin_size = 1  # in pixels
-            max_r = int(np.ceil(r.max()))
-            bins = np.arange(0, max_r + bin_size, bin_size)
-            from scipy.stats import binned_statistic
-            radial_mean, bin_edges, _ = binned_statistic(r.ravel(), psf.ravel(), statistic='mean', bins=bins)
-            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-            # Convert the radial bin centers to arcseconds.
-            x_axis_arcsec = bin_centers * pixel_scale_arcsec
-            ax_psf.plot(x_axis_arcsec, radial_mean/np.nanmax(radial_mean), '-')
-            ax_psf.set_xlabel("Radius [arcsec]")
-            ax_psf.set_ylabel("PSF intensity")
-            ax_psf.set_xscale('log')
-            # ax_psf.set_yscale('log')
-            ax_psf.set_title(f"PSF Radial Profile ({frequency:.1f} GHz)")
-            ax_psf.set_aspect('auto')
-        else:
-            raise ValueError("psf_mode must be either 'image' or 'profile'")
-
-        # Panel 4 (bottom row, spanning all columns): UV Sampling Density vs. UV Distance
-        ax_uvdensity = fig.add_subplot(gs[1, :])
-        ax_uvdensity.set_title("UV Sampling Density")
-        # Compute radial distances of the uv points
-        uv_dist = np.sqrt(uv[:, 0] ** 2 + uv[:, 1] ** 2)
-        binwidth = 10
-        bins = np.arange(0, np.max(uv_dist) + binwidth, binwidth)
-        counts, bin_edges = np.histogram(uv_dist, bins=bins)
-        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-        ax_uvdensity.step(bin_centers, counts, where='mid')
-        ax_uvdensity.set_xlabel("UV Distance [m]")
-        ax_uvdensity.set_ylabel(f"Density (counts/per {binwidth:d} m)")
-        if nyq_sample is not None:
-            ls = ['--', ':', '-.', '-']
-            for i, (k, v) in enumerate(nyq_sample.items()):
-                ax_uvdensity.axhline(v, ls=ls[i], color='gray', label=f'Nyquist sampling rate ({k})')
-
-        # ax_uvdensity.set_ylim(0, 100)
-        ax_uvdensity.set_yscale('log')
-        ax_uvdensity.legend()
-        #     ax_uvdensity.grid(True)
-
-        gs.tight_layout(fig)
-        # gs.update(hspace=0.0)
-        # return fig, (ax_ant, ax_uvcov, ax_psf, ax_uvdensity)
-        # If more than one positions array is provided, use new 2x2 layout (no PSF panel).
-        if array_config_str is not None:
-            fig.text(0.5, 0.93, array_config_str, ha='center', va='top', fontsize=12)
-        if figname is None:
-            figname = f'fig-layout_{title.replace(" ","_")}-{len(pos_list[0])}.jpg'
-        fig.savefig(figname, dpi=300)
-    else:
-        fig = plt.figure(figsize=(12, 8))
-        gs = gridspec.GridSpec(2, 3, height_ratios=[3, 1])
-
-        colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-
-        # Top left: Antenna Layout (overplot each positions array).
-        ax_ant = fig.add_subplot(gs[0, 0])
-        ax_ant.set_title(f"{title} - Antenna Layout")
-        for idx, pos in enumerate(pos_list):
-            if len(labels)==len(pos_list):
-                label = labels[idx]
-            else:
-                label = f"Set {idx+1}"
-            ax_ant.plot(pos[:, 0], pos[:, 1], 'o', label=label, color=colors[idx % len(colors)])
-        ax_ant.set_xlabel("X [m]")
-        ax_ant.set_ylabel("Y [m]")
-        ax_ant.set_aspect('equal')
-        ax_ant.legend()
-
-        # Top right: UV Coverage.
-        ax_uvcov = fig.add_subplot(gs[0, 1])
-        ax_uvcov.set_title(f"{title} - UV Coverage")
-        for idx, pos in enumerate(pos_list):
-            if len(labels)==len(pos_list):
-                label = labels[idx]
-            else:
-                label = f"Set {idx+1}"
-            uv = compute_uv_coverage(pos)
-            ax_uvcov.plot(uv[:, 0], uv[:, 1], '.', markersize=1, label = label, color=colors[idx % len(colors)])
-        ax_uvcov.set_xlabel("u [m]")
-        ax_uvcov.set_ylabel("v [m]")
-        ax_uvcov.set_aspect('equal')
-        ax_uvcov.legend()
-
-        # Bottom (spanning both columns): UV Sampling Density.
-        ax_uvdensity = fig.add_subplot(gs[1, :])
-        ax_uvdensity.set_title("UV Sampling Density")
-        for idx, pos in enumerate(pos_list):
-            if len(labels)==len(pos_list):
-                label = labels[idx]
-            else:
-                label = f"Set {idx+1}"
-            uv = compute_uv_coverage(pos)
-            uv_dist = np.sqrt(uv[:,0]**2 + uv[:,1]**2)
-            binwidth = 10
-            bins = np.arange(0, np.max(uv_dist) + binwidth, binwidth)
-            counts, bin_edges = np.histogram(uv_dist, bins=bins)
-            bin_centers = 0.5*(bin_edges[:-1] + bin_edges[1:])
-            ax_uvdensity.step(bin_centers, counts, where='mid', label=label, color=colors[idx % len(colors)])
-        ax_uvdensity.set_xlabel("UV Distance [m]")
-        ax_uvdensity.set_ylabel(f"Density (counts/per {binwidth} m)")
-        if nyq_sample is not None:
-            ls = ['--', ':', '-.', '-']
-            for j, (k, v) in enumerate(nyq_sample.items()):
-                ax_uvdensity.axhline(v, ls=ls[j % len(ls)], color='gray', label=f'Nyquist rate ({k})')
-        ax_uvdensity.set_yscale('log')
-        ax_uvdensity.legend()
-
-        plt.tight_layout()
-        if figname is None:
-            figname = f'fig-layout_{"_".join(labels)}.jpg'
-        fig.savefig(figname, dpi=300)
-        # return fig, (ax_ant, ax_uvcov, ax_uvdensity)
-
-
 def radial_profile(psf, bin_size=1):
     """
     Compute the averaged radial profile of a 2D image (psf).
@@ -684,14 +518,17 @@ def radial_profile(psf, bin_size=1):
     """
     y_idx, x_idx = np.indices(psf.shape)
     center = (psf.shape[0] // 2, psf.shape[1] // 2)
-    r = np.sqrt((x_idx - center[1])**2 + (y_idx - center[0])**2)
+    r = np.sqrt((x_idx - center[1]) ** 2 + (y_idx - center[0]) ** 2)
     max_r = int(np.ceil(r.max()))
     bins = np.arange(0, max_r + bin_size, bin_size)
-    radial_mean, bin_edges, _ = binned_statistic(r.ravel(), psf.ravel(), statistic='mean', bins=bins)
+    radial_mean, bin_edges, _ = binned_statistic(
+        r.ravel(), psf.ravel(), statistic='mean', bins=bins)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
     return bin_centers, radial_mean
 
+@runtime_report
 def plot_all_panels(positions, title='', labels=[], frequency=2, nyq_sample=None,
+                    image_fits=None, pad_factor=4, crop_uv_bins=10,
                     figname=None, array_config_str=None, psf_mode='uprofile'):
     """
     Plot antenna positions, UV coverage, PSF, and UV sampling density in a 2x3 layout.
@@ -738,15 +575,18 @@ def plot_all_panels(positions, title='', labels=[], frequency=2, nyq_sample=None
         if positions.ndim == 2:
             pos_list = [positions]
         else:
-            raise ValueError("If 'positions' is a numpy array, it must be 2D with shape (N,2).")
+            raise ValueError(
+                "If 'positions' is a numpy array, it must be 2D with shape (N,2).")
     elif isinstance(positions, (list, tuple)):
         pos_list = []
         for pos in positions:
             if not (isinstance(pos, np.ndarray) and pos.ndim == 2):
-                raise ValueError("Each element in 'positions' must be a 2D numpy array with shape (N,2).")
+                raise ValueError(
+                    "Each element in 'positions' must be a 2D numpy array with shape (N,2).")
             pos_list.append(pos)
     else:
-        raise ValueError("'positions' must be either a 2D numpy array or a list/tuple of such arrays.")
+        raise ValueError(
+            "'positions' must be either a 2D numpy array or a list/tuple of such arrays.")
 
     # If there is more than one configuration, force psf_mode to 'profile'
     npos = len(pos_list)
@@ -763,8 +603,9 @@ def plot_all_panels(positions, title='', labels=[], frequency=2, nyq_sample=None
     ax_ant = fig.add_subplot(gs[0, 0])
     ax_ant.set_title(f"{title} - Antenna Layout")
     for idx, pos in enumerate(pos_list):
-        lab = labels[idx] if (labels and len(labels)==len(pos_list)) else f"Set {idx+1}"
-        ax_ant.plot(pos[:, 0], pos[:, 1], 'o', label=lab, color=colors[idx % len(colors)])
+        lab = labels[idx] if (labels and len(labels) == len(pos_list)) else f"Set {idx + 1}"
+        ax_ant.plot(pos[:, 0], pos[:, 1], 'o', label=lab,
+                    color=colors[idx % len(colors)])
     ax_ant.set_xlabel("X [m]")
     ax_ant.set_ylabel("Y [m]")
     ax_ant.set_aspect('equal')
@@ -780,9 +621,10 @@ def plot_all_panels(positions, title='', labels=[], frequency=2, nyq_sample=None
     ax_uvcov = fig.add_subplot(gs[0, 1])
     ax_uvcov.set_title(f"{title} - UV Coverage")
     for idx, pos in enumerate(pos_list):
-        lab = labels[idx] if (labels and len(labels)==len(pos_list)) else f"Set {idx+1}"
+        lab = labels[idx] if (labels and len(labels) == len(pos_list)) else f"Set {idx + 1}"
         uv = compute_uv_coverage(pos)
-        ax_uvcov.plot(uv[:, 0], uv[:, 1], '.', markersize=1, label=lab, color=colors[idx % len(colors)])
+        ax_uvcov.plot(uv[:, 0], uv[:, 1], '.', markersize=1,
+                      label=lab, color=colors[idx % len(colors)])
     ax_uvcov.set_xlabel("u [m]")
     ax_uvcov.set_ylabel("v [m]")
     ax_uvcov.set_aspect('equal')
@@ -809,18 +651,20 @@ def plot_all_panels(positions, title='', labels=[], frequency=2, nyq_sample=None
         v_min, v_max = np.min(uv[:, 1]), np.max(uv[:, 1])
         H, xedges, yedges = np.histogram2d(uv[:, 0], uv[:, 1], bins=grid_size,
                                            range=[[u_min, u_max], [v_min, v_max]])
-        psf = np.abs(np.fft.fftshift(np.fft.fft2(H, s=(padded_size, padded_size))))
+        psf = np.abs(np.fft.fftshift(
+            np.fft.fft2(H, s=(padded_size, padded_size))))
 
         # Compute pixel scale in arcsec:
         C_LIGHT = 3e8
         lambda_m = C_LIGHT / (frequency * 1e9)
-        pixel_scale_rad = (grid_size * lambda_m) / ((u_max - u_min) * padded_size)
+        pixel_scale_rad = (grid_size * lambda_m) / \
+            ((u_max - u_min) * padded_size)
         pixel_scale_arcsec = pixel_scale_rad * 206265
         fov_arcsec = padded_size * pixel_scale_arcsec
-        lab = labels[idx] if (labels and len(labels)==len(pos_list)) else f"Set {idx+1}"
+        lab = labels[idx] if (labels and len(labels) == len(pos_list)) else f"Set {idx + 1}"
 
         if psf_mode == 'image':
-            im_psf = ax_psf.imshow(psf, extent=[-fov_arcsec/2, fov_arcsec/2, -fov_arcsec/2, fov_arcsec/2],
+            im_psf = ax_psf.imshow(psf, extent=[-fov_arcsec / 2, fov_arcsec / 2, -fov_arcsec / 2, fov_arcsec / 2],
                                    origin='lower', aspect='equal', cmap='viridis', alpha=1)
             ax_psf.set_xlabel("RA [arcsec]")
             ax_psf.set_ylabel("DEC [arcsec]")
@@ -830,55 +674,60 @@ def plot_all_panels(positions, title='', labels=[], frequency=2, nyq_sample=None
             # Compute the averaged radial profile.
             y_idx, x_idx = np.indices(psf.shape)
             center = (psf.shape[0] // 2, psf.shape[1] // 2)
-            r = np.sqrt((x_idx - center[1])**2 + (y_idx - center[0])**2)
+            r = np.sqrt((x_idx - center[1]) ** 2 + (y_idx - center[0]) ** 2)
             bin_size = 1  # pixel bin size
             max_r = int(np.ceil(r.max()))
             bins_r = np.arange(0, max_r + bin_size, bin_size)
-            radial_mean, bin_edges, _ = binned_statistic(r.ravel(), psf.ravel(), statistic='mean', bins=bins_r)
+            radial_mean, bin_edges, _ = binned_statistic(
+                r.ravel(), psf.ravel(), statistic='mean', bins=bins_r)
             bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
             r_arcsec = bin_centers * pixel_scale_arcsec
-            ax_psf.plot(r_arcsec, radial_mean/np.nanmax(radial_mean), '-', color=colors[idx % len(colors)], label=lab)
+            ax_psf.plot(r_arcsec, radial_mean / np.nanmax(radial_mean),
+                        '-', color=colors[idx % len(colors)], label=lab)
             ax_psf.set_xscale('log')
-            ax_psf.set_yscale('log')
+            ax_psf.set_yscale('linear')
             ax_psf.set_xlabel("Radius [arcsec]")
             ax_psf.set_ylabel("Normalized PSF intensity")
             ax_psf.legend()
         elif psf_mode == 'uprofile':
             center_y = psf.shape[0] // 2
             profile = psf[center_y, :]
-            x_axis = np.linspace(-fov_arcsec/2, fov_arcsec/2, psf.shape[1])
-            ax_psf.plot(x_axis, profile/np.nanmax(profile), '-', color=colors[idx % len(colors)], label=lab)
+            x_axis = np.linspace(-fov_arcsec / 2, fov_arcsec / 2, psf.shape[1])
+            ax_psf.plot(x_axis, profile / np.nanmax(profile), '-',
+                        color=colors[idx % len(colors)], label=lab)
             ax_psf.set_xscale('log')
-            ax_psf.set_yscale('log')
+            ax_psf.set_yscale('linear')
             ax_psf.set_xlabel("U [arcsec]")
             ax_psf.set_ylabel("Normalized PSF intensity")
             ax_psf.legend()
         elif psf_mode == 'vprofile':
             center_x = psf.shape[1] // 2
             profile = psf[:, center_x]
-            y_axis = np.linspace(-fov_arcsec/2, fov_arcsec/2, psf.shape[0])
-            ax_psf.plot(y_axis, profile/np.nanmax(profile), '-', color=colors[idx % len(colors)], label=lab)
+            y_axis = np.linspace(-fov_arcsec / 2, fov_arcsec / 2, psf.shape[0])
+            ax_psf.plot(y_axis, profile / np.nanmax(profile), '-',
+                        color=colors[idx % len(colors)], label=lab)
             ax_psf.set_xscale('log')
-            ax_psf.set_yscale('log')
+            ax_psf.set_yscale('linear')
             ax_psf.set_xlabel("V [arcsec]")
             ax_psf.set_ylabel("Normalized PSF intensity")
             ax_psf.legend()
         else:
-            raise ValueError("psf_mode must be 'image', 'rprofile' (or 'profile'), 'uprofile', or 'vprofile'")
-
+            raise ValueError(
+                "psf_mode must be 'image', 'rprofile' (or 'profile'), 'uprofile', or 'vprofile'")
 
     # Panel 4 (bottom row, spanning all columns): UV Sampling Density.
     ax_uvdensity = fig.add_subplot(gs[1, :])
     ax_uvdensity.set_title("UV Sampling Density")
     for idx, pos in enumerate(pos_list):
-        lab = labels[idx] if (labels and len(labels)==len(pos_list)) else f"Set {idx+1}"
+        lab = labels[idx] if (labels and len(labels) == len(pos_list)) else f"Set {idx + 1}"
         uv = compute_uv_coverage(pos)
-        uv_dist = np.sqrt(uv[:, 0]**2 + uv[:, 1]**2)
+        uv_dist = np.sqrt(uv[:, 0] ** 2 + uv[:, 1] ** 2)
         binwidth = 10
         bins_uv = np.arange(0, np.max(uv_dist) + binwidth, binwidth)
         counts, bin_edges = np.histogram(uv_dist, bins=bins_uv)
-        bin_centers = 0.5*(bin_edges[:-1] + bin_edges[1:])
-        ax_uvdensity.step(bin_centers, counts, where='mid', label=lab, color=colors[idx % len(colors)])
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        ax_uvdensity.step(bin_centers, counts, where='mid',
+                          label=lab, color=colors[idx % len(colors)])
     ax_uvdensity.set_xlabel("UV Distance [m]")
     ax_uvdensity.set_ylabel(f"Density (counts/per {binwidth:d} m)")
     if nyq_sample is not None:
@@ -889,12 +738,40 @@ def plot_all_panels(positions, title='', labels=[], frequency=2, nyq_sample=None
     if npos > 1:
         ax_uvdensity.legend()
 
+    # overlay FFT radial profile if requested
+    if image_fits:
+        # read image, compute FFT amplitude
+        smap = sunpy.map.Map(image_fits)
+        Z = smap.data
+        padded = np.fft.fftshift(np.fft.fft2(
+            Z, s=(Z.shape[0] * pad_factor, Z.shape[1] * pad_factor)))
+        amp = np.abs(padded)
+        amin, amax = amp.min(), amp.max()
+        amp_norm = (amp - amin) / (amax - amin) if amax > amin else amp
+        # radial profile of amp_norm
+        cen_pix, mean_amp = radial_profile(amp_norm, bin_size=1)
+        # compute uv_extent in metres
+        λ = C_LIGHT / (frequency * 1e9)
+        fft_extent = (3600 * 180 / np.pi) / (pad_factor * Z.shape[0] * smap.scale.axis2.value * 3600) * λ * \
+            amp_norm.shape[0]
+        uv_scale = fft_extent / amp_norm.shape[0]
+        uv_r = cen_pix * uv_scale
+        # twin-y to show FFT profile
+        ax_uvdensity_tw = ax_uvdensity.twinx()
+        ax_uvdensity_tw.plot(uv_r, mean_amp / np.nanmax(mean_amp),
+                             color='k', label='Sun viz amp', alpha=0.5)
+        ax_uvdensity_tw.set_ylabel("Norm Viz amp")
+        ax_uvdensity_tw.set_yscale('log')
+        ax_uvdensity_tw.legend(loc='upper right')
+        ax_uvdensity_tw.axhline(3e-4, ls='--', color='gray')
+
     gs.tight_layout(fig)
     # gs.update(hspace=0.0)
 
     # Save the figure if a filename is provided.
     if figname is not None:
         fig.savefig(figname, dpi=300)
+
 
 def geodetic_to_ecef(lon, lat, h):
     """
@@ -1001,7 +878,8 @@ def read_casa_antenna_list(cfg_filename):
             break
 
     if cofa_lon is None or cofa_lat is None:
-        raise ValueError("COFA information not found in header of the config file.")
+        raise ValueError(
+            "COFA information not found in header of the config file.")
 
     # Read the antenna data (skip header lines).
     data = np.genfromtxt(cfg_filename, comments='#')
@@ -1022,7 +900,8 @@ def read_casa_antenna_list(cfg_filename):
     # E = - sin(lon0) * dX + cos(lon0) * dY
     # N = - sin(lat0)*cos(lon0) * dX - sin(lat0)*sin(lon0) * dY + cos(lat0) * dZ
     E = - np.sin(lon0) * dX + np.cos(lon0) * dY
-    N = - np.sin(lat0) * np.cos(lon0) * dX - np.sin(lat0) * np.sin(lon0) * dY + np.cos(lat0) * dZ
+    N = - np.sin(lat0) * np.cos(lon0) * dX - np.sin(lat0) * \
+        np.sin(lon0) * dY + np.cos(lat0) * dZ
 
     positions = np.column_stack((E, N))
     return positions, (cofa_lon, cofa_lat, cofa_alt)
@@ -1104,12 +983,6 @@ This script:
   - Simulates an observation and predicts visibilities using the FITS file as the sky model.
 """
 
-import os
-import numpy as np
-from astropy.io import fits
-from casatools import simulator, measures, vpmanager, image
-from datetime import datetime
-
 
 def update_fits_header(fits_file, freq_GHz):
     """
@@ -1135,9 +1008,63 @@ def update_fits_header(fits_file, freq_GHz):
     hdul.close()
     print(f"Updated {fits_file}: CRVAL3 and RESTFRQ set to {freq_value} Hz")
 
+def generate_caltb(msfile, caltype=['ph','amp', 'mbd'], calerr=[0.05, 0.05, 0.01]):
+    '''
+    Generate CASA calibration tables (caltb) to corrupt the visibilities in a Measurement Set (MS) by assuming potential errors in the calibration.
+    Default to generate phase (ph), amplitude (amp), and multi-band delay (mhd) calibration tables.
+    The default errors are 5% for phase, 5% for amplitude, and 0.01 ns for multi-band delay.
+    Parameters:
+        msfile : str
+            Path to the Measurement Set file.
+        caltype : list of str
+            List of calibration types to generate. Options are 'ph' (phase), 'amp' (amplitude), 'mbd' (multi-band delay).
+        calerr : list of float
+            List of errors for each calibration type in radians for phase, fractional for amplitude, and nanoseconds for multi-band delay.
+    '''
+    from casatasks import gencal
+    from casatools import ms
 
+    ms_tool = ms()
+    ms_tool.open(msfile)
+    mdata = ms_tool.metadata()
+    nant = mdata.nantennas()
+    ant_names = mdata.antennanames()
+    antlist = ','.join(ant_names)
+    ms_tool.close()
+
+    gaintable = []
+    for cal in caltype:
+        if cal == 'ph':
+            # Generate phase calibration table
+            err = calerr[caltype.index(cal)]
+            caltable = f'caltb_FASR_corrupt_{np.int_(err*100)}pct.ph'
+            os.system(f'rm -rf {caltable}')
+            pha = np.degrees(np.random.normal(0, err*2*np.pi, nant))
+            gencal(vis=msfile, caltable = caltable, caltype='ph', antenna=antlist, parameter=pha.flatten().tolist())
+            print(f"Generated phase calibration table: {caltable}")
+        elif cal == 'amp':
+            # Generate amplitude calibration table
+            err = calerr[caltype.index(cal)]
+            caltable = f'caltb_FASR_corrupt_{np.int_(err*100)}pct.amp'
+            os.system(f'rm -rf {caltable}')
+            amp = np.random.normal(1, err, nant)
+            gencal(vis=msfile, caltable=caltable, caltype='amp', antenna=antlist, parameter=amp.tolist())
+            print(f"Generated amplitude calibration table: {caltable}")
+        elif cal == 'mbd':
+            # Generate multi-band delay calibration table
+            err = calerr[caltype.index(cal)]
+            caltable = f'caltb_FASR_corrupt_{err}ns.mbd'
+            os.system(f'rm -rf {caltable}')
+            mbd = np.random.normal(0, err, nant)
+            gencal(vis=msfile, caltable=caltable, caltype='mbd', antenna=antlist, parameter=mbd.tolist())
+            print(f"Generated multi-band delay calibration table: {caltable}")
+        gaintable.append(caltable)
+
+    return gaintable
+
+@runtime_report
 def generate_ms(config_file, solar_model, reftime, freqghz=None,
-                integration_time=60, msname='fasr.ms', duration=None):
+                integration_time=60, msname='fasr.ms', duration=None, noise='0.5MK'):
     """
     Generate a Measurement Set (MS) using CASA's simulator tool with the solar model read from a FITS file.
 
@@ -1177,10 +1104,13 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None,
     y = antenna_params[:, 1]
     z = antenna_params[:, 2]
     dish_dia = antenna_params[:, 3]  # Use dish diameters from the file.
+    nant = len(dish_dia)
+    N_bl = nant * (nant - 1) // 2
     try:
-        ant_names = np.genfromtxt(config_file, comments='#', usecols=(4,), dtype=str)
+        ant_names = np.genfromtxt(
+            config_file, comments='#', usecols=(4,), dtype=str)
     except Exception:
-        ant_names = ['A' + "{0:02d}".format(i) for i in range(len(x))]
+        ant_names = ['A' + "{0:03d}".format(i) for i in range(len(x))]
 
     # Read the solar model FITS file using Astropy.
     hdul = fits.open(solar_model)
@@ -1210,14 +1140,15 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None,
 
     print("Extracted from FITS header:")
     print(f"Frequency = {freq_GHz}")
-    print("Source RA = {:.6f} rad, DEC = {:.6f} rad".format(source_ra, source_dec))
+    print("Source RA = {:.6f} rad, DEC = {:.6f} rad".format(
+        source_ra, source_dec))
 
     # Set the antenna configuration.
     sm.setconfig(telescopename="FASR",
                  x=x, y=y, z=z,
                  dishdiameter=dish_dia[0],
                  mount='alt-az',
-                 antname=ant_names,
+                 antname=list(ant_names), ## must be a list of strings. np.array will not work.
                  padname="FASR",
                  coordsystem='global')
 
@@ -1262,12 +1193,15 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None,
                          blockagediam='0.5m', maxrad='{0:.3f}deg'.format(np.degrees(1.22 * 3e8 / (1e9 * dishdiam))),
                          reffreq=freq_GHz, dopb=True)
     sm.setvp(dovp=True, usedefaultvp=False)
-    solar_model_copy = os.path.join(os.path.dirname(msname), os.path.basename(solar_model))
-    solar_model_im = os.path.join(os.path.dirname(msname), os.path.basename(solar_model.replace('.fits', '.im')))
+    solar_model_copy = os.path.join(os.path.dirname(
+        msname), os.path.basename(solar_model))
+    solar_model_im = os.path.join(os.path.dirname(
+        msname), os.path.basename(solar_model.replace('.fits', '.im')))
     os.system(f'cp -r {solar_model} {solar_model_copy}')
     # if not os.path.exists(solar_model_im):
     update_fits_header(solar_model_copy, freq_GHz)
-    ia.fromfits(outfile=solar_model_im, infile=solar_model_copy, overwrite=True)
+    ia.fromfits(outfile=solar_model_im,
+                infile=solar_model_copy, overwrite=True)
     ia.close()
     # ia.open(solar_model_im)
     # mycs = ia.coordsys()
@@ -1277,10 +1211,20 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None,
     # ia.setcoordsys(mycs.torecord())
     # print(mycs.torecord())
     # ia.close()
+
     sm.predict(imagename=solar_model_im)
-    sm.setnoise(mode='tsys-atm', trx=500)
 
     sm.close()
+
+    sm.openfromms(msname)
+    if noise is None:
+        pass
+        # sm.setnoise(mode='tsys-atm', trx=500)
+    else:
+        noisejy = calc_noise(noise, config_file, float(freq_GHz.rstrip('GHz')), duration, integration_time)
+        sm.setnoise(mode='simplenoise', simplenoise=f'{noisejy:.2f}Jy')
+        sm.corrupt()
+    sm.done()
     print("Simulation complete. Measurement set generated:", msname)
 
 
@@ -1324,11 +1268,13 @@ def plot_casa_image(image_filename, crop_fraction=(0.0, 1.0), figsize=(10, 7), t
     # Determine the cropping indices.
     p1 = int(pix.shape[0] * crop_fraction[0])
     p2 = int(pix.shape[0] * crop_fraction[1])
-    cropped = pix[p1:p2, p1:p2].transpose()  # transpose for correct orientation
+    # transpose for correct orientation
+    cropped = pix[p1:p2, p1:p2].transpose()
 
     # Plot the cropped image using the WCS projection.
     fig, ax = plt.subplots(1, 1, figsize=figsize, subplot_kw={'projection': w})
-    im = ax.imshow(cropped, origin='lower', cmap=plt.get_cmap(cmap), norm=norm, vmax=np.nanpercentile(cropped, 99.99))
+    im = ax.imshow(cropped, origin='lower', cmap=plt.get_cmap(
+        cmap), norm=norm, vmax=np.nanpercentile(cropped, 99.99))
     plt.colorbar(im, ax=ax)
     ax.set_xlabel('Right Ascension')
     ax.set_ylabel('Declination')
@@ -1336,20 +1282,14 @@ def plot_casa_image(image_filename, crop_fraction=(0.0, 1.0), figsize=(10, 7), t
 
     return fig, ax
 
-
-import numpy as np
-import matplotlib.pyplot as plt
-from casatools import image as IA
-from astropy.wcs import WCS
-
-
+@runtime_report
 def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
                                           crop_fraction=(0.0, 1.0),
                                           figsize=(15, 4),
-                                          title1='First Image',
-                                          title2='Second (Convolved) Image',
+                                          image_meta={'freq': '', 'title': ['', ''],'array_config': ''},
                                           compare_two=False,
                                           contour_levels=None, cmap='viridis',
+                                          conv_tag='',
                                           overwrite_conv=True, vmax=99.9, vmin=0,
                                           vmax2=None, vmin2=None, ):
     """
@@ -1381,6 +1321,13 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
       fig, axs : tuple
           Matplotlib figure and axes objects.
     """
+    titiles = image_meta.get('title', ["", ""])
+    title1 = titiles[0]
+    title2 = titiles[1]
+    freqstr = image_meta.get('freq', '')
+    array_config = image_meta.get('array_config', '')
+    noise = image_meta.get('noise', None)
+    cal_error = image_meta.get('cal_error', None)
     if not compare_two:
         figsize = (figsize[0] / 3 * 2, figsize[1])
     ia = IA()
@@ -1388,7 +1335,8 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     ia.open(image1_filename)
     pix1 = ia.getchunk()[:, :, 0, 0]  # assume image shape [nx, ny, 1, 1]
     csys1 = ia.coordsys()
-    beam = ia.restoringbeam()  # e.g., returns {'major': {'value': 6.0, 'unit': 'arcsec'},
+    # e.g., returns {'major': {'value': 6.0, 'unit': 'arcsec'},
+    beam = ia.restoringbeam()
     #                   'minor': {'value': 6.0, 'unit': 'arcsec'},
     #                   'positionangle': {'value': 0.0, 'unit': 'deg'}}
     ia.close()
@@ -1402,7 +1350,7 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     w.wcs.ctype = ['RA---SIN', 'DEC--SIN']
 
     # Generate an output filename for the convolved image.
-    output_filename = image2_filename.replace('.im', '.im.convolved')
+    output_filename = image2_filename.replace('.im', f'{conv_tag}.im.convolved')
 
     # --- Convolve the second image with the restoring beam from image1 using IA.convolve2d ---
     # Format beam parameters as strings.
@@ -1424,6 +1372,16 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
 
     # --- Crop both images using the same crop_fraction ---
     shape = pix1.shape[0]  # assume square images.
+
+    crop_fraction_rms = (0.9, 1.0)
+    p1_rms = int(shape * crop_fraction_rms[0])
+    p2_rms = int(shape * crop_fraction_rms[1])
+    datamax1 = np.nanmax(pix1)
+    datamax2 = np.nanmax(pix2)
+    cropped1_rms = pix1[p1_rms:p2_rms, p1_rms:p2_rms]
+    rms1 = np.sqrt(np.nanmean(cropped1_rms**2))
+    snr1 = datamax1 / rms1
+    # snr2 = signal2 / np.nanstd(pix2[p1_rms:p2_rms, p1_rms:p2_rms])
     if isinstance(crop_fraction[0], float):
         p1 = int(shape * crop_fraction[0])
         p2 = int(shape * crop_fraction[1])
@@ -1440,11 +1398,15 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
         cropped1 = pix1
         cropped2 = pix2
 
+    datamin1 = np.nanmin(cropped1)
+
     # --- Plotting: Create a figure with two panels using the WCS projection from image1 ---
     if compare_two:
-        fig, axs = plt.subplots(1, 3, figsize=figsize, subplot_kw={'projection': w})
+        fig, axs = plt.subplots(1, 3, figsize=figsize,
+                                subplot_kw={'projection': w})
     else:
-        fig, axs = plt.subplots(1, 2, figsize=figsize, subplot_kw={'projection': w})
+        fig, axs = plt.subplots(1, 2, figsize=figsize,
+                                subplot_kw={'projection': w})
 
     vmax_val = np.nanmax(cropped2) * float(vmax) / 100
     vmin_val = np.nanmax(cropped2) * float(vmin) / 100
@@ -1461,7 +1423,21 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     ax1.set_xlabel('Right Ascension')
     ax1.set_ylabel('Declination')
     ax1.set_title(title1)
-    plt.colorbar(im1, ax=ax1)
+    ax1.text(0.98,0.02, r'T$_{Bmin}$'+f': {datamin1:.1e} K', transform=ax1.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax1.text(0.98,0.08, r'T$_{Bmax}$'+f': {datamax1:.1e} K', transform=ax1.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax1.text(0.98,0.14, f'SNR: {snr1:.1f}', transform=ax1.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax1.text(0.02, 0.02, freqstr, transform=ax1.transAxes, ha='left',
+             va='bottom', color='white')
+    ax1.text(0.02, 0.98, f'Array cfg: {array_config}', transform=ax1.transAxes, ha='left',
+             va='top', color='white',)
+    ax1.text(0.02,0.92, f'Themal noise: {noise}', transform=ax1.transAxes, ha='left',
+             va='top', color='white',)
+    ax1.text(0.02,0.86, f'Cal err: {cal_error}', transform=ax1.transAxes, ha='left',
+                va='top', color='white',)
+    plt.colorbar(im1, ax=ax1, label=r'T$_B$ [K]')
 
     # Right panel: Convolved Image2 as background.
     ax2 = axs[-1]
@@ -1470,7 +1446,11 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     ax2.set_xlabel('Right Ascension')
     ax2.set_ylabel('Declination')
     ax2.set_title(title2)
-    plt.colorbar(im2, ax=ax2)
+    ax2.text(0.98,0.02, r'T$_{Bmax}$'+f': {datamax2:.1e} K', transform=ax2.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax2.text(0.02, 0.02, freqstr, transform=ax2.transAxes, ha='left',
+             va='bottom', color='white')
+    plt.colorbar(im2, ax=ax2, label=r'T$_B$ [K]')
 
     # Overlay contours from image1 onto the right panel.
     if compare_two:
@@ -1492,8 +1472,8 @@ def plot_two_casa_images_with_convolution(image1_filename, image2_filename,
     plt.tight_layout()
     return fig, axs
 
-
-def plot_two_casa_images(image1_filename, image2_filename,
+@runtime_report
+def plot_two_casa_images0(image1_filename, image2_filename,
                          crop_fraction=(0.0, 1.0),
                          figsize=(15, 4),
                          title1='First Image',
@@ -1501,7 +1481,9 @@ def plot_two_casa_images(image1_filename, image2_filename,
                          compare_two=False,
                          contour_levels=None, cmap='viridis',
                          vmax=99.9, vmin=0,
-                         uni_vmaxmin=False):
+                         uni_vmaxmin=False,
+                         norm='linear',
+                         image_model_filename=None):
     """
     Open two CASA images using casatools.image (IA), convolve the second image
     with the restoring beam from the first image, and plot them side-by-side.
@@ -1533,6 +1515,7 @@ def plot_two_casa_images(image1_filename, image2_filename,
     """
     if not compare_two:
         figsize = (figsize[0] / 3 * 2, figsize[1])
+
     ia = IA()
     # --- Open the first image and extract data, coordinate system, and restoring beam ---
     ia.open(image1_filename)
@@ -1572,6 +1555,12 @@ def plot_two_casa_images(image1_filename, image2_filename,
     pix2 = ia.getchunk()[:, :, 0, 0]
     ia.close()
 
+    if image_model_filename is not None:
+        ia.open(image_model_filename)
+        pix_model = ia.getchunk()[:, :, 0, 0]
+        ia.close()
+        figsize = (figsize[0], figsize[1] * 2)
+
     # --- Crop both images using the same crop_fraction ---
     shape = pix1.shape[0]  # assume square images.
     if isinstance(crop_fraction[0], float):
@@ -1579,6 +1568,8 @@ def plot_two_casa_images(image1_filename, image2_filename,
         p2 = int(shape * crop_fraction[1])
         cropped1 = pix1[p1:p2, p1:p2]
         cropped2 = pix2[p1:p2, p1:p2]
+        if image_model_filename is not None:
+            cropped_model = pix_model[p1:p2, p1:p2]
     elif isinstance(crop_fraction[0], tuple) or isinstance(crop_fraction[0], list):
         px1 = int(shape * crop_fraction[0][0])
         px2 = int(shape * crop_fraction[0][1])
@@ -1586,15 +1577,21 @@ def plot_two_casa_images(image1_filename, image2_filename,
         py2 = int(shape * crop_fraction[1][1])
         cropped1 = pix1[px1:px2, py1:py2]
         cropped2 = pix2[px1:px2, py1:py2]
+        if image_model_filename is not None:
+            cropped_model = pix_model[px1:px2, py1:py2]
     else:
         cropped1 = pix1
         cropped2 = pix2
+        if image_model_filename is not None:
+            cropped_model = pix_model
 
     # --- Plotting: Create a figure with two panels using the WCS projection from image1 ---
     if compare_two:
-        fig, axs = plt.subplots(1, 3, figsize=figsize, subplot_kw={'projection': w})
+        fig, axs = plt.subplots(1, 3, figsize=figsize,
+                                subplot_kw={'projection': w})
     else:
-        fig, axs = plt.subplots(1, 2, figsize=figsize, subplot_kw={'projection': w})
+        fig, axs = plt.subplots(1, 2, figsize=figsize,
+                                subplot_kw={'projection': w})
 
     vmax_val1 = np.nanmax(cropped1) * float(vmax) / 100
     vmin_val1 = np.nanmax(cropped1) * float(vmin) / 100
@@ -1607,7 +1604,7 @@ def plot_two_casa_images(image1_filename, image2_filename,
     # Left panel: Image1 (original)
     ax1 = axs[0]
     im1 = ax1.imshow(cropped1.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
-                     vmax=vmax_val1, vmin=vmin_val1)
+                     vmax=vmax_val1, vmin=vmin_val1, norm=norm)
     ax1.set_xlabel('Right Ascension')
     ax1.set_ylabel('Declination')
     ax1.set_title(title1)
@@ -1616,7 +1613,7 @@ def plot_two_casa_images(image1_filename, image2_filename,
     # Right panel: Convolved Image2 as background.
     ax2 = axs[-1]
     im2 = ax2.imshow(cropped2.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
-                     vmax=vmax_val2, vmin=vmin_val2)
+                     vmax=vmax_val2, vmin=vmin_val2, norm=norm)
     ax2.set_xlabel('Right Ascension')
     ax2.set_ylabel('Declination')
     ax2.set_title(title2)
@@ -1626,7 +1623,7 @@ def plot_two_casa_images(image1_filename, image2_filename,
     if compare_two:
         ax_comp = axs[1]
         im2 = ax_comp.imshow(cropped2.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
-                             vmax=vmax_val2, vmin=vmin_val2)
+                             vmax=vmax_val2, vmin=vmin_val2, norm=norm)
         ax_comp.set_xlabel('Right Ascension')
         ax_comp.set_ylabel('Declination')
 
@@ -1638,6 +1635,251 @@ def plot_two_casa_images(image1_filename, image2_filename,
         cs = axs[1].contour(cropped1.transpose(), levels=contour_levels, colors='tab:cyan', origin='lower',
                             linewidths=0.5)
         ax_comp.set_title(f'Contour: Left Panel, Background: Right Panel')
+
+    plt.tight_layout()
+    return fig, axs
+
+@runtime_report
+def plot_two_casa_images(image1_filename, image2_filename,
+                          crop_fraction=(0.0, 1.0),
+                          figsize=(15, 4),
+                          image_meta={'freq': '', 'title': ['', ''],'array_config': ['', '']},
+                          contour_levels=None, cmap='viridis',
+                          cmap_model='turbo',
+                          vmax=100.0, vmin=0.0,
+                          vmax_percentile=99.9, vmin_percentile=0,
+                          uni_vmaxmin=False,
+                          image1_model_filename=None,
+                          image2_model_filename=None):
+    """
+    Open two CASA images using casatools.image (IA), convolve the second image
+    with the restoring beam from the first image, and plot them side-by-side.
+
+    The left panel shows the (optionally cropped) first image. The right panel shows
+    the second image after convolution with the restoring beam from the first image,
+    with contours from the first image overlaid.
+
+    Parameters:
+      image1_filename : str
+          Path to the first CASA image file.
+      image2_filename : str
+          Path to the second CASA image file.
+      crop_fraction : tuple of float, optional
+          Fractional start and end indices (e.g., (0.0, 1.0) uses the full image).
+      figsize : tuple, optional
+          The figure size in inches.
+      title1 : str, optional
+          Title for the left panel.
+      title2 : str, optional
+          Title for the right panel.
+      contour_levels : array-like or None, optional
+          Contour levels to overlay on the second panel.
+          If None, levels are set to default percentiles of the first image.
+
+    Returns:
+      fig, axs : tuple
+          Matplotlib figure and axes objects.
+    """
+    titiles = image_meta.get('title', ["", ""])
+    title1 = titiles[0]
+    title2 = titiles[1]
+    freqstr = image_meta.get('freq', '')
+    array_configs = image_meta.get('array_config', '')
+    array_config1 = array_configs[0]
+    array_config2 = array_configs[1]
+    noise = image_meta.get('noise', None)
+    cal_error = image_meta.get('cal_error', None)
+
+    ia = IA()
+    # --- Open the first image and extract data, coordinate system, and restoring beam ---
+    ia.open(image1_filename)
+    pix1 = ia.getchunk()[:, :, 0, 0]  # assume image shape [nx, ny, 1, 1]
+    csys1 = ia.coordsys()
+    # beam = ia.restoringbeam()  # e.g., returns {'major': {'value': 6.0, 'unit': 'arcsec'},
+    #                   'minor': {'value': 6.0, 'unit': 'arcsec'},
+    #                   'positionangle': {'value': 0.0, 'unit': 'deg'}}
+    ia.close()
+
+    # Build an Astropy WCS object using the CASA coordinate system from image1.
+    rad_to_deg = 180.0 / np.pi
+    w = WCS(naxis=2)
+    w.wcs.crpix = csys1.referencepixel()['numeric'][0:2]
+    w.wcs.cdelt = np.array(csys1.increment()['numeric'][0:2]) * rad_to_deg
+    w.wcs.crval = np.array(csys1.referencevalue()['numeric'][0:2]) * rad_to_deg
+    w.wcs.ctype = ['RA---SIN', 'DEC--SIN']
+
+    # # Generate an output filename for the convolved image.
+    # output_filename = image2_filename.replace('.im', '.im.convolved')
+    #
+    # # --- Convolve the second image with the restoring beam from image1 using IA.convolve2d ---
+    # # Format beam parameters as strings.
+    # major = f"{beam['major']['value']}{beam['major']['unit']}"
+    # minor = f"{beam['minor']['value']}{beam['minor']['unit']}"
+    # pa = f"{beam['positionangle']['value']}{beam['positionangle']['unit']}"
+
+    # if overwrite_conv or not os.path.exists(output_filename):
+    #     # Open the second image and apply convolution.
+    #     ia.open(image2_filename)
+    #     ia.convolve2d(outfile=output_filename, axes=[0, 1], type='gauss',
+    #                   major=major, minor=minor, pa=pa, overwrite=True)
+    #     ia.close()
+
+    # --- Read the convolved image to extract its pixel data ---
+    ia.open(image2_filename)
+    pix2 = ia.getchunk()[:, :, 0, 0]
+    ia.close()
+
+    if image1_model_filename is not None:
+        ia.open(image1_model_filename)
+        pix_model1 = ia.getchunk()[:, :, 0, 0]
+        ia.close()
+        ia.open(image2_model_filename)
+        pix_model2 = ia.getchunk()[:, :, 0, 0]
+        ia.close()
+        figsize = (figsize[0], figsize[1] * 2)
+
+    # --- Crop both images using the same crop_fraction ---
+    shape = pix1.shape[0]  # assume square images.
+
+    crop_fraction_rms = (0.9, 1.0)
+    p1_rms = int(shape * crop_fraction_rms[0])
+    p2_rms = int(shape * crop_fraction_rms[1])
+    datamax1 = np.nanmax(pix1)
+    datamax2 = np.nanmax(pix2)
+
+    cropped1_rms = pix1[p1_rms:p2_rms, p1_rms:p2_rms]
+    rms1 = np.sqrt(np.nanmean(cropped1_rms**2))
+    snr1 = datamax1 / rms1
+    cropped2_rms = pix2[p1_rms:p2_rms, p1_rms:p2_rms]
+    rms2 = np.sqrt(np.nanmean(cropped2_rms**2))
+    snr2 = datamax2 / rms2
+
+    if isinstance(crop_fraction[0], float):
+        p1 = int(shape * crop_fraction[0])
+        p2 = int(shape * crop_fraction[1])
+        cropped1 = pix1[p1:p2, p1:p2]
+        cropped2 = pix2[p1:p2, p1:p2]
+        if image1_model_filename is not None:
+            cropped1_model = pix_model1[p1:p2, p1:p2]
+            cropped2_model = pix_model2[p1:p2, p1:p2]
+    elif isinstance(crop_fraction[0], tuple) or isinstance(crop_fraction[0], list):
+        px1 = int(shape * crop_fraction[0][0])
+        px2 = int(shape * crop_fraction[0][1])
+        py1 = int(shape * crop_fraction[1][0])
+        py2 = int(shape * crop_fraction[1][1])
+        cropped1 = pix1[px1:px2, py1:py2]
+        cropped2 = pix2[px1:px2, py1:py2]
+        if image1_model_filename is not None:
+            cropped1_model = pix_model1[px1:px2, py1:py2]
+            cropped2_model = pix_model2[px1:px2, py1:py2]
+    else:
+        cropped1 = pix1
+        cropped2 = pix2
+        if image1_model_filename is not None:
+            cropped1_model = pix_model1
+            cropped2_model = pix_model2
+    datamin1 = np.nanmin(cropped1)
+    datamin2 = np.nanmin(cropped2)
+
+    if image1_model_filename is not None:
+        diff1 = np.abs(cropped1_model - cropped1)
+        diff2 = np.abs(cropped2_model - cropped2)
+        diff1[diff1 < rms1*0.75] = rms1*0.75
+        diff2[diff2 < rms2*0.75] = rms2*0.75
+        img_fidelity1 = cropped1 / diff1
+        img_fidelity2 = cropped2 / diff2
+    else:
+        img_fidelity1 = cropped1
+        img_fidelity2 = cropped2
+
+    # --- Plotting: Create a figure with two panels using the WCS projection from image1 ---
+    fig, axs = plt.subplots(2, 2, figsize=figsize,
+                            subplot_kw={'projection': w})
+
+    vmax_val1 = np.nanmax(cropped1) * float(vmax) / 100
+    vmin_val1 = np.nanmax(cropped1) * float(vmin) / 100
+    if uni_vmaxmin:
+        vmax_val2 = vmax_val1
+        vmin_val2 = vmin_val1
+    else:
+        vmax_val2 = np.nanmax(cropped2) * float(vmax) / 100
+        vmin_val2 = np.nanmax(cropped2) * float(vmin) / 100
+
+    vmax_val1_model = np.nanpercentile(img_fidelity1, vmax_percentile)
+    vmin_val1_model = np.nanpercentile(img_fidelity1, vmin_percentile)
+    vmax_val2_model = np.nanpercentile(img_fidelity1, vmax_percentile)
+    vmin_val2_model = np.nanpercentile(img_fidelity1, vmin_percentile)
+
+    if uni_vmaxmin:
+        vmax_val2_model = vmax_val1_model if vmax_val1_model > vmax_val2_model else vmax_val2_model
+        vmin_val2_model = vmin_val1_model if vmin_val1_model < vmin_val2_model else vmin_val2_model
+    else:
+        vmax_val2_model = np.nanpercentile(img_fidelity2, vmax_percentile)
+        vmin_val2_model = np.nanpercentile(img_fidelity2, vmin_percentile)
+
+    # Left panel: Image1 (original)
+    ax1 = axs[0, 0]
+    im1 = ax1.imshow(cropped1.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
+                     vmax=vmax_val1, vmin=vmin_val1)
+    ax1.set_xlabel('Right Ascension')
+    ax1.set_ylabel('Declination')
+    ax1.set_title(title1)
+    ax1.text(0.98,0.02, r'T$_{Bmin}$'+f': {datamin1:.1e} K', transform=ax1.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax1.text(0.98,0.08, r'T$_{Bmax}$'+f': {datamax1:.1e} K', transform=ax1.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax1.text(0.98,0.14, f'SNR: {snr1:.1f}', transform=ax1.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax1.text(0.02, 0.02, freqstr, transform=ax1.transAxes, ha='left',
+             va='bottom', color='white')
+    ax1.text(0.02, 0.98, f'Array cfg: {array_config1}', transform=ax1.transAxes, ha='left',
+             va='top', color='white', fontweight='bold')
+    ax1.text(0.02,0.92, f'Themal noise: {noise}', transform=ax1.transAxes, ha='left',
+             va='top', color='white',)
+    ax1.text(0.02,0.86, f'Cal err: {cal_error}', transform=ax1.transAxes, ha='left',
+             va='top', color='white',)
+    plt.colorbar(im1, ax=ax1, label=r'T$_B$ [K]')
+
+    # Right panel: Convolved Image2 as background.
+    ax2 = axs[0, 1]
+    im2 = ax2.imshow(cropped2.transpose(), origin='lower', cmap=plt.get_cmap(cmap),
+                     vmax=vmax_val2, vmin=vmin_val2)
+    ax2.set_xlabel('Right Ascension')
+    ax2.set_ylabel('Declination')
+    ax2.set_title(title2)
+    ax2.text(0.98,0.02, r'T$_{Bmin}$'+f': {datamin2:.1e} K', transform=ax2.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax2.text(0.98,0.08, r'T$_{Bmax}$'+f': {datamax2:.1e} K', transform=ax2.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax2.text(0.98,0.14, f'SNR: {snr2:.1f}', transform=ax2.transAxes, ha='right',
+             va='bottom', color='white',)
+    ax2.text(0.02, 0.02, freqstr, transform=ax2.transAxes, ha='left',
+             va='bottom', color='white')
+    ax2.text(0.02, 0.98, f'Array cfg: {array_config2}', transform=ax2.transAxes, ha='left',
+             va='top', color='white', fontweight='bold')
+    ax2.text(0.02,0.92, f'Themal noise: {noise}', transform=ax2.transAxes, ha='left',
+             va='top', color='white',)
+    ax2.text(0.02,0.86, f'Cal err: {cal_error}', transform=ax2.transAxes, ha='left',
+             va='top', color='white',)
+    plt.colorbar(im2, ax=ax2, label=r'T$_B$ [K]')
+
+    # Left panel: Image1 (original)
+    ax3 = axs[1, 0]
+    im3 = ax3.imshow(img_fidelity1.transpose(), origin='lower', cmap=plt.get_cmap(cmap_model),
+                     vmax=vmax_val1_model, vmin=vmin_val1_model)
+    ax3.set_xlabel('Right Ascension')
+    ax3.set_ylabel('Declination')
+    ax3.set_title('Fidelity image')
+    plt.colorbar(im3, ax=ax3, label=r'I/|I-T|')
+
+    # Right panel: Convolved Image2 as background.
+    ax4 = axs[1, 1]
+    im4 = ax4.imshow(img_fidelity2.transpose(), origin='lower', cmap=plt.get_cmap(cmap_model),
+                     vmax=vmax_val2_model, vmin=vmin_val2_model)
+    ax4.set_xlabel('Right Ascension')
+    ax4.set_ylabel('Declination')
+    ax4.set_title('Fidelity image')
+    plt.colorbar(im4, ax=ax4, label=r'I/|I-T|')
 
     plt.tight_layout()
     return fig, axs
