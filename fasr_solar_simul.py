@@ -47,7 +47,7 @@ def make_imname(msname: str,
                 ) -> str:
     parts = [msname]
     if phaerr is not None:
-        phaerr_deg = np.rad2deg(phaerr * 2. * np.pi)
+        phaerr_deg = phaerr * 360.0
         parts.append(f'phaerr{phaerr_deg:.0f}deg')
     if amperr is not None:
         parts.append(f'amperr{np.int_(amperr * 100)}pct')
