@@ -1256,6 +1256,130 @@ def plot_all_panels(positions, title='', labels=[], frequency=5, nyq_sample=None
         fig.savefig(figname, dpi=300)
 
 
+def hadec_to_azel(ha_deg, dec_deg, lat_deg):
+    """
+    Converts Hour Angle (HA) and Declination (Dec) to Azimuth and Elevation.
+    Returns: Az (radians), El (radians)
+    """
+    ha = np.radians(ha_deg)
+    dec = np.radians(dec_deg)
+    lat = np.radians(lat_deg)
+
+    sin_el = np.sin(dec) * np.sin(lat) + np.cos(dec) * np.cos(lat) * np.cos(ha)
+    el = np.arcsin(np.clip(sin_el, -1, 1))
+
+    # Azimuth formula
+    # sin(Az) = - sin(HA) * cos(Dec) / cos(El)
+    # cos(Az) = (sin(Dec) - sin(El)*sin(Lat)) / (cos(El)*cos(Lat))
+
+    # Using arctan2 for robustness
+    # y_term = sin(Azimuth) * cos(Elevation)
+    y = -np.sin(ha) * np.cos(dec)
+
+    # x_term = cos(Azimuth) * cos(Elevation)
+    # Derivation: cos(A) * cos(E) = (sin(d) - sin(phi)sin(E)) / cos(phi)
+    x = (np.sin(dec) - np.sin(el) * np.sin(lat)) / np.cos(lat)
+
+    # Now both are scaled by cos(E), so the ratio y/x is correct
+    az = np.arctan2(y, x)
+
+    return az, el
+
+
+def calculate_shadowing(positions, dish_diameter=1.5, lat_deg=40.0, ngrid_ha=100, ngrid_dec=60):
+    """
+    Calculates number of shadowed antennas for a grid of HA and Dec.
+
+    positions: (N, 2) numpy array of antenna coordinates (x=East, y=North)
+    dish_diameter: Diameter in meters (shadowing threshold)
+    lat_deg: Observatory latitude
+    """
+    # Add z-coordinate (assume flat array)
+    n_ant = positions.shape[0]
+    ant_pos = np.hstack((positions, np.zeros((n_ant, 1))))  # (N, 3)
+
+    # Simulation Grid
+    ha_range = np.linspace(-90, 90, ngrid_ha)  # -6h to +6h
+    dec_range = np.linspace(-23.5, 23.5, ngrid_dec)  # Winter to Summer Solstice
+
+    shadow_grid = np.zeros((len(dec_range), len(ha_range)))
+    el_grid = np.zeros((len(dec_range), len(ha_range)))
+
+    print(f"Simulating shadowing for {n_ant} antennas...")
+
+    for i, dec in enumerate(dec_range):
+        for j, ha in enumerate(ha_range):
+
+            # 1. Get Sun Position vector
+            az, el = hadec_to_azel(ha, dec, lat_deg)
+            el_deg = np.degrees(el)
+            el_grid[i, j] = el_deg  # Store for plotting
+
+            # If sun is below horizon, ignore (or mark as invalid)
+            if el <= 0:
+                shadow_grid[i, j] = np.nan
+                continue
+
+            # Vector pointing TO the source (Sun)
+            # Standard conversion: x=East, y=North, z=Up
+            s_vec = np.array([
+                np.sin(az) * np.cos(el),
+                np.cos(az) * np.cos(el),
+                np.sin(el)
+            ])
+
+            # 2. Project Antennas onto plane perpendicular to Sun
+            # We construct a basis (u, v) perpendicular to s_vec (w)
+            # w = s_vec
+            # v = z_axis x s_vec (horizontal vector) -> normalized
+            # u = v x w
+
+            # Robust basis construction
+            # If s_vec is vertical (zenith), handle gracefully
+            if abs(s_vec[2]) > 0.99:
+                u_vec = np.array([1, 0, 0])
+                v_vec = np.array([0, 1, 0])
+            else:
+                up = np.array([0, 0, 1])
+                v_vec = np.cross(s_vec, up)
+                v_vec /= np.linalg.norm(v_vec)
+                u_vec = np.cross(v_vec, s_vec)
+
+            # Project positions: u = r . u_vec, v = r . v_vec
+            u_coords = ant_pos @ u_vec
+            v_coords = ant_pos @ v_vec
+            w_coords = ant_pos @ s_vec  # Distance along Line of Sight
+
+            # 3. Check Shadows
+            # An antenna is shadowed if another antenna is:
+            # a) Within distance D in (u,v) plane
+            # b) Has a LARGER w coordinate (is closer to the sun)
+
+            # We sort antennas by w (closest to sun first)
+            # This makes checking easier: we only check if current ant is shadowed by previous ones
+
+            indices = np.argsort(w_coords)[::-1]  # Descending w (Source -> Ground)
+            sorted_u = u_coords[indices]
+            sorted_v = v_coords[indices]
+
+            shadowed_count = 0
+
+            # Simple N^2 check (fast enough for N=120)
+            for k in range(n_ant):
+                current_u = sorted_u[k]
+                current_v = sorted_v[k]
+
+                # Check against all antennas "upstream" (indices 0 to k-1)
+                if k > 0:
+                    dist_sq = (sorted_u[:k] - current_u) ** 2 + (sorted_v[:k] - current_v) ** 2
+                    if np.any(dist_sq < dish_diameter ** 2):
+                        shadowed_count += 1
+
+            shadow_grid[i, j] = shadowed_count
+
+    return ha_range, dec_range, el_grid, shadow_grid
+
+
 def geodetic_to_ecef(lon, lat, h):
     """
     Convert geodetic coordinates (lon, lat, h) to ECEF (ITRF) coordinates.
