@@ -2246,7 +2246,6 @@ def generate_ms(config_file, solar_model, reftime, freqghz=None, channel_width_m
     # Read the solar model FITS file using Astropy.
     hdul = fits.open(solar_model)
     header = hdul[0].header
-    flux = hdul[0].data[0, 0]  # Assume the model flux is in the primary HDU.
 
     # Read frequency from CRVAL3 (Hz) and convert to GHz.
     if freqghz is None:
