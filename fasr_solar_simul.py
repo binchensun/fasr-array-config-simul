@@ -2147,21 +2147,28 @@ def calc_total_flux_on_dish(solar_model, dish_diameter=1.5, freqghz=None):
     header = hdul[0].header
     flux = hdul[0].data[0, 0]  # Assume the model flux is in the primary HDU.
 
-    # Read frequency from CRVAL3 (Hz) and convert to GHz.
+    # Read or normalize frequency to GHz as a float.
     if freqghz is None:
         freq_Hz = header.get('CRVAL3')
         if freq_Hz is None:
             raise ValueError("Frequency (CRVAL3) not found in FITS header.")
-        freq_GHz = f'{freq_Hz / 1e9}GHz'
+        freq_ghz = float(freq_Hz) / 1e9
     else:
-        freq_GHz = freqghz
+        # Allow freqghz as a float (GHz) or as a string like "1.4GHz".
+        if isinstance(freqghz, str):
+            match = re.match(r"\s*([0-9.+eE-]+)", freqghz)
+            if not match:
+                raise ValueError(f"Could not parse frequency from string: {freqghz!r}")
+            freq_ghz = float(match.group(1))
+        else:
+            freq_ghz = float(freqghz)
 
     # Calculate total flux from the model
     # Create a mask that corresponds to lambda / dish_diameter
     dx_model = header.get('CDELT1') * 3600.  # in arcsec
     dy_model = header.get('CDELT2') * 3600.  # in arcsec
     nx = header.get('NAXIS1')
-    primary_beam = 1.22 * (3e10 / (float(freq_GHz.rstrip('GHz')) * 1e9)) / (dish_diameter * 100) * (206265.)  # in arcsec
+    primary_beam = 1.22 * (3e10 / (freq_ghz * 1e9)) / (dish_diameter * 100) * (206265.)  # in arcsec
     # Mask out pixels outside the primary beam
     ics = int(nx / 2)
     radius_pix = int(primary_beam / 2 * dx_model)  # masking out beyond half power point
