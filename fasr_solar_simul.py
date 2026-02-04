@@ -251,7 +251,7 @@ def calc_noise(tsys, array_config_file, dish_diameter=None, total_flux=None, dur
     baseline_lengths = get_baseline_lengths(array_config_file)
     positions, _ = read_casa_antenna_list(array_config_file)
     if dish_diameter is None:
-        antenna_params = np.genfromtxt(config_file, comments='#')
+        antenna_params = np.genfromtxt(array_config_file, comments='#')
         dish_diameter = antenna_params[0, 3]
     n_ant = len(positions)
     n_bl = len(baseline_lengths)
