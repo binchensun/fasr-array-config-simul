@@ -2168,11 +2168,13 @@ def calc_total_flux_on_dish(solar_model, dish_diameter=1.5, freqghz=None):
     dx_model = header.get('CDELT1') * 3600.  # in arcsec per pixel
     dy_model = header.get('CDELT2') * 3600.  # in arcsec per pixel
     nx = header.get('NAXIS1')
+    ny = header.get('NAXIS2')
     primary_beam = 1.22 * (3e10 / (float(freq_GHz.rstrip('GHz')) * 1e9)) / (dish_diameter * 100) * (206265.)  # in arcsec
     # Mask out pixels outside the primary beam
-    ics = int(nx / 2)
-    radius_pix = int(primary_beam / 2 / dx_model)  # masking out beyond half power point
-    y_model, x_model = np.ogrid[-ics:nx - ics, -ics:nx - ics]
+    cx = int(nx / 2)
+    cy = int(ny / 2)
+    radius_pix = int(primary_beam / 2 * dx_model)  # masking out beyond half power point
+    y_model, x_model = np.ogrid[-cy:ny - cy, -cx:nx - cx]
     mask = x_model * x_model + y_model * y_model >= radius_pix * radius_pix
     flux_masked = np.copy(flux)
     flux_masked[mask] = np.nan
